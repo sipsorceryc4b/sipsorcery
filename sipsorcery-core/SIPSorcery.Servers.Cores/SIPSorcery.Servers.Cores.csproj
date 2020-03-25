@@ -313,8 +313,8 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="..\_version.cs">
-      <Link>_version.cs</Link>
+    <Compile Include="..\_versionsipsorcery.cs">
+      <Link>_versionsipsorcery.cs</Link>
     </Compile>
     <Compile Include="AppCommon\SilverlightPolicyServer.cs" />
     <Compile Include="SIPProxy\SIPCallDispatcherFile.cs" />

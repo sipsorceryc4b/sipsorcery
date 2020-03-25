@@ -58,6 +58,7 @@ namespace SIPSorcery.Net
 
         //private static Dictionary<string, DNSResponse> m_dnsResponses = new Dictionary<string, DNSResponse>();  // DNS query responses that have been looked up and stored.
 
+        private static object m_lookupLock = new object();
         private static Queue<LookupRequest> m_queuedLookups = new Queue<LookupRequest>();                       // Used to store queued lookups.
         private static List<LookupRequest> m_inProgressLookups = new List<LookupRequest>();                   // Used to store lookup requests both that are queued and that are in progress.
         //private static List<string> m_inProgressLookups = new List<string>();
@@ -248,17 +249,13 @@ namespace SIPSorcery.Net
 
         private static void QueueLookup(LookupRequest lookupRequest)
         {
-            lock (m_inProgressLookups)
+            lock (m_lookupLock)
             {
                 LookupRequest inProgressLookup = (from lookup in m_inProgressLookups where lookup.QueryType.ToString() == lookupRequest.QueryType.ToString() && lookup.Hostname == lookupRequest.Hostname select lookup).FirstOrDefault();
                 if (inProgressLookup == null)
                 {
                     m_inProgressLookups.Add(lookupRequest);
-
-                    lock (m_queuedLookups)
-                    {
-                        m_queuedLookups.Enqueue(lookupRequest);
-                    }
+                    m_queuedLookups.Enqueue(lookupRequest);
 
                     logger.Debug("DNSManager lookup queued for " + lookupRequest.QueryType + " " + lookupRequest.Hostname + ", queue size=" + m_queuedLookups.Count + ", in progress=" + m_queuedLookups.Count + ".");
                     m_lookupARE.Set();
@@ -267,16 +264,13 @@ namespace SIPSorcery.Net
                 {
                     if (lookupRequest.CompleteEvent != null)
                     {
-                        lock (m_queuedLookups)
+                        if (inProgressLookup.Duplicates == null)
                         {
-                            if (inProgressLookup.Duplicates == null)
-                            {
-                                inProgressLookup.Duplicates = new List<LookupRequest>() { lookupRequest };
-                            }
-                            else
-                            {
-                                inProgressLookup.Duplicates.Add(lookupRequest);
-                            }
+                            inProgressLookup.Duplicates = new List<LookupRequest>() {lookupRequest};
+                        }
+                        else
+                        {
+                            inProgressLookup.Duplicates.Add(lookupRequest);
                         }
 
                         logger.Debug("DNSManager duplicate lookup added for " + lookupRequest.QueryType + " " + lookupRequest.Hostname + ", queue size=" + m_queuedLookups.Count + ", in progress=" + m_queuedLookups.Count + ".");
@@ -307,7 +301,7 @@ namespace SIPSorcery.Net
 
                         try
                         {
-                            lock (m_queuedLookups)
+                            lock (m_lookupLock)
                             {
                                 if (m_queuedLookups.Count > 0)
                                 {
@@ -387,7 +381,7 @@ namespace SIPSorcery.Net
                         {
                             try
                             {
-                                if (dnsResponse != null)
+                                lock (m_lookupLock)
                                 {
                                     if (lookupRequest.CompleteEvent != null)
                                     {
@@ -402,10 +396,7 @@ namespace SIPSorcery.Net
                                             duplicateRequest.CompleteEvent.Set();
                                         }
                                     }
-                                }
 
-                                lock (m_inProgressLookups)
-                                {
                                     m_inProgressLookups.Remove(lookupRequest);
                                 }
                             }

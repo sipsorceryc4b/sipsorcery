@@ -131,8 +131,8 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="..\_version.cs">
-      <Link>_version.cs</Link>
+    <Compile Include="..\_versionsipsorcery.cs">
+      <Link>_versionsipsorcery.cs</Link>
     </Compile>
     <Compile Include="AppState.cs">
       <SubType>Code</SubType>

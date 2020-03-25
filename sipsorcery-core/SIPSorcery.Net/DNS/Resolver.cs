@@ -277,7 +277,8 @@ namespace Heijden.DNS
                 m_UseCache = value;
                 if (!m_UseCache)
                 {
-                    m_ResponseCache.Clear();
+                    lock(m_ResponseCache)
+                        m_ResponseCache.Clear();
                 }
             }
         }
@@ -287,7 +288,8 @@ namespace Heijden.DNS
         /// </summary>
         public void ClearCache()
         {
-            m_ResponseCache.Clear();
+            lock(m_ResponseCache)
+                m_ResponseCache.Clear();
         }
 
         private DNSResponse SearchInCache(Question question)
@@ -894,16 +896,20 @@ namespace Heijden.DNS
                 else
                 {
                     // Check that the active DNS server is getting responses.
-                    if (m_receiveTimeouts.ContainsKey(m_activeDNSServer) && m_receiveTimeouts[m_activeDNSServer] >= SWITCH_ACTIVE_TIMEOUT_COUNT)
+                    lock (m_receiveTimeouts)
                     {
-                        // Switch active DNS server to alternative end point as too many consectutive receive failures on this one.
-                        foreach (IPEndPoint dnsServer in m_DnsServers)
+                        if (m_receiveTimeouts.ContainsKey(m_activeDNSServer) && m_receiveTimeouts[m_activeDNSServer] >= SWITCH_ACTIVE_TIMEOUT_COUNT)
                         {
-                            if (dnsServer != m_activeDNSServer)
+                            // Switch active DNS server to alternative end point as too many consectutive receive failures on this one.
+                            foreach (IPEndPoint dnsServer in m_DnsServers)
                             {
-                                logger.Debug("Switching active DNS server from " + m_activeDNSServer + " to " + dnsServer + ".");
-                                m_activeDNSServer = dnsServer;
-                                ResetTimeoutCount(m_activeDNSServer);
+                                if (dnsServer != m_activeDNSServer)
+                                {
+                                    logger.Debug("Switching active DNS server from " + m_activeDNSServer + " to " + dnsServer + ".");
+                                    m_activeDNSServer = dnsServer;
+                                    ResetTimeoutCount(m_activeDNSServer);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -917,13 +923,16 @@ namespace Heijden.DNS
         {
             if (m_DnsServers != null && m_DnsServers.Count > 1)
             {
-                if (!m_receiveTimeouts.ContainsKey(dnsServer))
+                lock (m_receiveTimeouts)
                 {
-                    m_receiveTimeouts.Add(dnsServer, 1);
-                }
-                else
-                {
-                    m_receiveTimeouts[dnsServer] = m_receiveTimeouts[dnsServer] + 1;
+                    if (!m_receiveTimeouts.ContainsKey(dnsServer))
+                    {
+                        m_receiveTimeouts.Add(dnsServer, 1);
+                    }
+                    else
+                    {
+                        m_receiveTimeouts[dnsServer] = m_receiveTimeouts[dnsServer] + 1;
+                    }
                 }
             }
         }
@@ -932,13 +941,16 @@ namespace Heijden.DNS
         {
             if (m_DnsServers != null && m_DnsServers.Count > 1)
             {
-                if (!m_receiveTimeouts.ContainsKey(dnsServer))
+                lock (m_receiveTimeouts)
                 {
-                    m_receiveTimeouts.Add(dnsServer, 0);
-                }
-                else
-                {
-                    m_receiveTimeouts[dnsServer] = 0;
+                    if (!m_receiveTimeouts.ContainsKey(dnsServer))
+                    {
+                        m_receiveTimeouts.Add(dnsServer, 0);
+                    }
+                    else
+                    {
+                        m_receiveTimeouts[dnsServer] = 0;
+                    }
                 }
             }
         }

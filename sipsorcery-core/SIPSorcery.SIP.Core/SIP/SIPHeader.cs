@@ -2257,7 +2257,7 @@ namespace SIPSorcery.SIP
                         else if (headerNameLower == SIPHeaders.SIP_COMPACTHEADER_SUPPORTED ||
                             headerNameLower == SIPHeaders.SIP_HEADER_SUPPORTED.ToLower())
                         {
-                            sipHeader.Supported = headerValue;
+                            AddHeaderValue(ref sipHeader.Supported, headerValue);
                         }
                         #endregion
                         #region Authentication-Info
@@ -2287,7 +2287,7 @@ namespace SIPSorcery.SIP
                         #region Allow
                         else if (headerNameLower == SIPHeaders.SIP_HEADER_ALLOW.ToLower())
                         {
-                            sipHeader.Allow = headerValue;
+                            AddHeaderValue(ref sipHeader.Allow, headerValue);
                         }
                         #endregion
                         #region Call-Info
@@ -2495,6 +2495,14 @@ namespace SIPSorcery.SIP
                 logger.Error("Exception ParseSIPHeaders. " + excp.Message);
                 throw new SIPValidationException(SIPValidationFieldsEnum.Headers, "Unknown error parsing Headers.");
             }
+        }
+
+        private static void AddHeaderValue(ref string headerField, string value)
+        {
+            if (!string.IsNullOrWhiteSpace(headerField))
+                headerField += $", {value}";
+            else
+                headerField = value;
         }
 
         /// <summary>

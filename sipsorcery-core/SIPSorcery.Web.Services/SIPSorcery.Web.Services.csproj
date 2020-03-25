@@ -210,8 +210,8 @@
     <Content Include="Provisioning\SIPProvisioningWebService.svc" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="..\_version.cs">
-      <Link>_version.cs</Link>
+    <Compile Include="..\_versionsipsorcery.cs">
+      <Link>_versionsipsorcery.cs</Link>
     </Compile>
     <Compile Include="CallDispatcher\ICallDispatcherService.cs" />
     <Compile Include="CallDispatcher\CallDispatcherProxy.cs" />

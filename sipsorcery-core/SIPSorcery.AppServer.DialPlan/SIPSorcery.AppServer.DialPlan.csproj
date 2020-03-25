@@ -236,8 +236,8 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="..\_version.cs">
-      <Link>_version.cs</Link>
+    <Compile Include="..\_versionsipsorcery.cs">
+      <Link>_versionsipsorcery.cs</Link>
     </Compile>
     <Compile Include="DialPlanApps\CallbackApp.cs" />
     <Compile Include="DialPlanApps\GoogleVoiceUserAgent.cs" />

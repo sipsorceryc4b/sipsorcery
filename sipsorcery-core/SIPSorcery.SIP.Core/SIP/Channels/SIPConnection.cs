@@ -97,6 +97,8 @@ namespace SIPSorcery.SIP
 
         private readonly Action<string> m_logDebug;
         private readonly Action<string> m_logError;
+        public long? OperationId; // HAV nur temporär, bis das Hängen beim Beenden von Federation geklärt ist.
+
 
         public SIPConnection(SIPChannel channel, TcpClient tcpClient, Stream sipStream, IPEndPoint remoteEndPoint, SIPProtocolsEnum connectionProtocol, SIPConnectionsEnum connectionType, Action<string> logDebug, Action<string> logError)
         {
@@ -348,8 +350,6 @@ namespace SIPSorcery.SIP
         {
             try
             {
-                // NUR TEMPORÄR WEGEN Task 6052: SipTransport "sauber" beenden
-
                 ExecSafe(() => _tcpClient.GetStream().Close(0), "SIPConnection Close Stream");
 
                 if (_tcpClient.Client != null && _tcpClient.Client.Connected)
@@ -358,9 +358,7 @@ namespace SIPSorcery.SIP
                     ExecSafe(() => _tcpClient.Client.Close(0), "Close Socket");
                 }
 
-                m_logDebug?.Invoke("SIPConnection Before TcpClient.Close");
                 _tcpClient.Close();
-                m_logDebug?.Invoke("SIPConnection Finished TcpClient.Close");
             }
             catch (Exception closeExcp)
             {
@@ -373,9 +371,7 @@ namespace SIPSorcery.SIP
         {
             try
             {
-                m_logDebug?.Invoke($"SIPConnection Before {description}");
                 exec();
-                m_logDebug?.Invoke($"SIPConnection Finished {description}");
             }
             catch (Exception e)
             {
