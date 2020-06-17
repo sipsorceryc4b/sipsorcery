@@ -44,6 +44,7 @@ using SIPSorcery.Sys;
 using log4net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 
 #if UNITTEST
 using NUnit.Framework;
@@ -76,6 +77,10 @@ namespace SIPSorcery.SIP
         private static ILog logger = AssemblyState.logger;
 
         private bool m_queueIncoming = true;     // Dictates whether the transport later will queue incoming requests for processing on a separate thread of process immediately on the same thread.
+
+        private TaskFactory m_incomingMessageTaskFactory = null;
+
+        private CancellationTokenSource m_closeTokenSource = null;
         // Most SIP elements with the exception of Stateless Proxies would typically want to queue incoming SIP messages.
 
         private bool m_transportThreadStarted = false;
@@ -138,6 +143,22 @@ namespace SIPSorcery.SIP
             ResolveSIPEndPoint_External = sipResolver;
             m_transactionEngine = transactionEngine;
             m_queueIncoming = queueIncoming;
+            m_incomingMessageTaskFactory = null;
+            m_closeTokenSource = null;
+        }
+
+        public SIPTransport(ResolveSIPEndPointDelegate sipResolver, SIPTransactionEngine transactionEngine, TaskScheduler incomingMessageScheduler)
+        {
+            if (sipResolver == null)
+            {
+                throw new ArgumentNullException("The SIP end point resolver must be set when creating a SIPTransport object.");
+            }
+
+            ResolveSIPEndPoint_External = sipResolver;
+            m_transactionEngine = transactionEngine;
+            m_queueIncoming = true;
+            m_closeTokenSource = new CancellationTokenSource();
+            m_incomingMessageTaskFactory = new TaskFactory(m_closeTokenSource.Token, TaskCreationOptions.None, TaskContinuationOptions.None, incomingMessageScheduler);
         }
 
         public SIPTransport(ResolveSIPEndPointDelegate sipResolver, SIPTransactionEngine transactionEngine, SIPChannel sipChannel, bool queueIncoming)
@@ -152,6 +173,8 @@ namespace SIPSorcery.SIP
             AddSIPChannel(sipChannel);
 
             m_queueIncoming = queueIncoming;
+            m_incomingMessageTaskFactory = null;
+            m_closeTokenSource = null;
         }
 
         /// <summary>
@@ -178,7 +201,7 @@ namespace SIPSorcery.SIP
                 // Wire up the SIP transport to the SIP channel.
                 sipChannel.SIPMessageReceived += ReceiveMessage;
 
-                if (m_queueIncoming && !m_transportThreadStarted)
+                if (m_incomingMessageTaskFactory == null && m_queueIncoming && !m_transportThreadStarted)
                 {
                     StartTransportThread();
                 }
@@ -233,7 +256,7 @@ namespace SIPSorcery.SIP
                 {
                     SIPMessageReceived(sipChannel, remoteEndPoint, buffer);
                 }
-                else
+                else if (m_incomingMessageTaskFactory == null)
                 {
                     IncomingMessage incomingMessage = new IncomingMessage(sipChannel, remoteEndPoint, buffer);
 
@@ -252,6 +275,10 @@ namespace SIPSorcery.SIP
 
                     m_inMessageArrived.Set();
                 }
+                else
+                {
+                    m_incomingMessageTaskFactory.StartNew(() => SIPMessageReceived(sipChannel, remoteEndPoint, buffer));
+                }
             }
             catch (Exception excp)
             {
@@ -265,6 +292,7 @@ namespace SIPSorcery.SIP
             try
             {
                 m_closed = true;
+                m_closeTokenSource?.Cancel();
 
                 foreach (SIPChannel channel in m_sipChannels.Values)
                 {
@@ -522,9 +550,16 @@ namespace SIPSorcery.SIP
 
         public void SendRequest(SIPRequest sipRequest)
         {
+            SendRequest(sipRequest, null);
+        }
+
+        private void SendRequest(SIPRequest sipRequest, SIPTransaction reliableTransaction)
+        {
             if (m_sipChannels.Count == 0)
             {
                 var msg = "No channels are configured in the SIP transport layer. The request could not be sent.";
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 TrySendResponseBackToVia(sipRequest, msg);
                 throw new ApplicationException(msg);
             }
@@ -534,11 +569,15 @@ namespace SIPSorcery.SIP
             if (dnsResult.LookupError != null)
             {
                 var msg = $"SIP Transport could not send request as DNS resolution for {dnsResult.URI.Host} failed '{dnsResult.LookupError}'.\r\n{sipRequest.ToString()}";
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 TrySendResponseBackToVia(sipRequest, msg);
                 throw new ApplicationException(msg);
             }
             else if (dnsResult.Pending)
             {
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 // The DNS lookup is still in progress, ignore this request and rely on the fact that the transaction retransmit mechanism will send another request.
             }
             else
@@ -547,15 +586,19 @@ namespace SIPSorcery.SIP
 
                 if (requestEndPoint != null && requestEndPoint.Address.Equals(BlackholeAddress))
                 {
+                    if (reliableTransaction != null)
+                        reliableTransaction.TransmitDone = true;
                     // Ignore packet, it's destined for the blackhole.
                 }
                 else if (requestEndPoint != null)
                 {
-                    SendRequest(requestEndPoint, sipRequest);
+                    SendRequest(requestEndPoint, sipRequest, reliableTransaction);
                 }
                 else
                 {
                     var msg = $"SIP Transport could not send request as end point could not be determined.\r\n{sipRequest.ToString()}";
+                    if (reliableTransaction != null)
+                        reliableTransaction.TransmitDone = true;
                     TrySendResponseBackToVia(sipRequest, msg);
                     throw new ApplicationException(msg);
                 }
@@ -564,8 +607,15 @@ namespace SIPSorcery.SIP
 
         public void SendRequest(SIPEndPoint dstEndPoint, SIPRequest sipRequest)
         {
+            SendRequest(dstEndPoint, sipRequest, null);
+        }
+
+        private void SendRequest(SIPEndPoint dstEndPoint, SIPRequest sipRequest, SIPTransaction reliableTransaction)
+        {
             if (dstEndPoint != null && dstEndPoint.Address.Equals(BlackholeAddress))
             {
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 // Ignore packet, it's destined for the blackhole.
                 return;
             }
@@ -573,6 +623,8 @@ namespace SIPSorcery.SIP
             if (m_sipChannels.Count == 0)
             {
                 var msg = "No channels are configured in the SIP transport layer. The request could not be sent.";
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 TrySendResponseBackToVia(sipRequest, msg);
                 throw new ApplicationException(msg);
             }
@@ -591,17 +643,19 @@ namespace SIPSorcery.SIP
 
             if (sipChannel != null)
             {
-                SendRequest(sipChannel, dstEndPoint, sipRequest);
+                SendRequest(sipChannel, dstEndPoint, sipRequest, reliableTransaction);
             }
             else
             {
                 var msg = $"A default SIP channel could not be found for protocol {sipRequest.LocalSIPEndPoint.Protocol} when sending SIP request.";
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 TrySendResponseBackToVia(sipRequest, msg);
                 throw new ApplicationException(msg);
             }
         }
 
-        private void SendRequest(SIPChannel sipChannel, SIPEndPoint dstEndPoint, SIPRequest sipRequest)
+        private void SendRequest(SIPChannel sipChannel, SIPEndPoint dstEndPoint, SIPRequest sipRequest, SIPTransaction reliableTransaction)
         {
             try
             {
@@ -611,22 +665,59 @@ namespace SIPSorcery.SIP
 
                 if (sipChannel.IsTLS)
                 {
-                    sipChannel.Send(dstEndPoint.GetIPEndPoint(), Encoding.UTF8.GetBytes(sipRequest.ToString()), dstEndPoint.Fqdn);
+                    sipChannel.Send(dstEndPoint.GetIPEndPoint(), Encoding.UTF8.GetBytes(sipRequest.ToString()), dstEndPoint.Fqdn,
+                        (done => OnSendRequestDone(done, reliableTransaction, sipChannel, dstEndPoint, sipRequest)), 
+                        () => IsTransactionCanceled(reliableTransaction));
                 }
                 else
                 {
-                    sipChannel.Send(dstEndPoint.GetIPEndPoint(), Encoding.UTF8.GetBytes(sipRequest.ToString()));
+                    sipChannel.Send(dstEndPoint.GetIPEndPoint(), Encoding.UTF8.GetBytes(sipRequest.ToString()),
+                        (done => OnSendRequestDone(done, reliableTransaction, sipChannel, dstEndPoint, sipRequest)), 
+                        () => IsTransactionCanceled(reliableTransaction));
                 }
-
-                FireSIPRequestOutTraceEvent(sipChannel.SIPChannelEndPoint, dstEndPoint, sipRequest);
             }
             catch (ApplicationException appExcp)
             {
                 var msg = $"ApplicationException SIPTransport SendRequest. {appExcp.Message}";
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 logger.Warn(msg);
                 TrySendResponseBackToVia(sipRequest, appExcp.Message);
                 throw new ApplicationException(msg);
             }
+        }
+
+        private void SendRequest(SIPTransaction sipTransaction)
+        {
+            if (sipTransaction.OutboundProxy != null)
+            {
+                SendRequest(sipTransaction.OutboundProxy, sipTransaction.TransactionRequest, sipTransaction);
+            }
+            else if (sipTransaction.RemoteEndPoint != null)
+            {
+                SendRequest(sipTransaction.RemoteEndPoint, sipTransaction.TransactionRequest, sipTransaction);
+            }
+            else
+            {
+                SendRequest(sipTransaction.TransactionRequest, sipTransaction);
+            }
+        }
+
+        private void OnSendRequestDone(bool succeded, SIPTransaction reliableTransaction, SIPChannel channel, SIPEndPoint dstEndPoint, SIPRequest request )
+        {
+            if (succeded)
+                FireSIPRequestOutTraceEvent(channel.SIPChannelEndPoint, dstEndPoint, request);
+            if (reliableTransaction == null)
+                return;
+            reliableTransaction.LastTransmit = DateTime.Now;
+            reliableTransaction.TransmitDone = true;
+        }
+
+        private bool IsTransactionCanceled(SIPTransaction reliableTransaction)
+        {
+            if (reliableTransaction == null)
+                return false;
+            return reliableTransaction.HasTimedOut;
         }
 
         private void TrySendResponseBackToVia(SIPRequest sipRequest, string errorMessage)
@@ -696,44 +787,37 @@ namespace SIPSorcery.SIP
                 }
 
                 if (sipTransaction.TransactionType == SIPTransactionTypesEnum.Invite &&
-                    sipTransaction.TransactionState == SIPTransactionStatesEnum.Completed)
+                    sipTransaction.TransactionState == SIPTransactionStatesEnum.Completed &&
+                    sipTransaction.LocalSIPEndPoint == null)
                 {
                     // This is an INVITE transaction that wants to send a reliable response.
-                    if (sipTransaction.LocalSIPEndPoint == null)
-                    {
-                        throw new ApplicationException("The SIPTransport layer cannot send a reliable SIP response because the send from socket has not been set for the transaction.");
-                    }
-                    else
-                    {
-                        SIPViaHeader topViaHeader = sipTransaction.TransactionFinalResponse.Header.Vias.TopViaHeader;
-                        SendResponse(sipTransaction.TransactionFinalResponse);
-                    }
+                    throw new ApplicationException("The SIPTransport layer cannot send a reliable SIP response because the send from socket has not been set for the transaction.");
                 }
-                else
-                {
-                    if (sipTransaction.OutboundProxy != null)
-                    {
-                        SendRequest(sipTransaction.OutboundProxy, sipTransaction.TransactionRequest);
-                    }
-                    else if (sipTransaction.RemoteEndPoint != null)
-                    {
-                        SendRequest(sipTransaction.RemoteEndPoint, sipTransaction.TransactionRequest);
-                    }
-                    else
-                    {
-                        SendRequest(sipTransaction.TransactionRequest);
-                    }
-                }
+
+                if (m_reliableTransmissions.TryGetValue(sipTransaction.TransactionId, out _))
+                    throw new ApplicationException("Cannot send reliable SIP message because there is a message pending for this transaction.");
 
                 sipTransaction.Retransmits = 1;
                 sipTransaction.InitialTransmit = DateTime.Now;
                 sipTransaction.LastTransmit = DateTime.Now;
                 sipTransaction.DeliveryPending = true;
-
-                if (m_reliableTransmissions.TryAdd(sipTransaction.TransactionId, sipTransaction))
-                    StartReliableTransmissionsThread();
-                else
+                sipTransaction.TransmitDone = false;
+                if (!m_reliableTransmissions.TryAdd(sipTransaction.TransactionId, sipTransaction))
                     throw new ApplicationException("Cannot send reliable SIP message because there is a message pending for this transaction.");
+
+                StartReliableTransmissionsThread();
+
+                if (sipTransaction.TransactionType == SIPTransactionTypesEnum.Invite &&
+                    sipTransaction.TransactionState == SIPTransactionStatesEnum.Completed)
+                {
+                    // This is an INVITE transaction that wants to send a reliable response.
+                    SIPViaHeader topViaHeader = sipTransaction.TransactionFinalResponse.Header.Vias.TopViaHeader;
+                    SendResponse(sipTransaction.TransactionFinalResponse, sipTransaction);
+                }
+                else
+                {
+                    SendRequest(sipTransaction);
+                }
             }
             catch
             {
@@ -761,7 +845,7 @@ namespace SIPSorcery.SIP
 
                 if (sipChannel != null)
                 {
-                    SendResponse(sipChannel, dstEndPoint, sipResponse);
+                    SendResponse(sipChannel, dstEndPoint, sipResponse, null);
                 }
                 else
                 {
@@ -772,14 +856,23 @@ namespace SIPSorcery.SIP
 
         public void SendResponse(SIPResponse sipResponse)
         {
+            SendResponse(sipResponse, null);
+        }
+
+        public void SendResponse(SIPResponse sipResponse, SIPTransaction reliableTransaction)
+        {
             if (sipResponse.LocalSIPEndPoint != null && sipResponse.LocalSIPEndPoint.Address.Equals(BlackholeAddress))
             {
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 // Ignore packet, it's destined for the blackhole.
                 return;
             }
 
             if (m_sipChannels.Count == 0)
             {
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 throw new ApplicationException("No channels are configured in the SIP transport layer. The response could not be sent.");
             }
 
@@ -788,6 +881,8 @@ namespace SIPSorcery.SIP
             if (topViaHeader == null)
             {
                 logger.Warn("There was no top Via header on a SIP response from " + sipResponse.RemoteSIPEndPoint + " when attempting to send it, response dropped.");
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 //logger.Warn(sipResponse.ToString());
             }
             else
@@ -797,20 +892,24 @@ namespace SIPSorcery.SIP
 
                 if (sipChannel != null)
                 {
-                    SendResponse(sipChannel, sipResponse);
+                    SendResponse(sipChannel, sipResponse, reliableTransaction);
                 }
                 else
                 {
+                    if (reliableTransaction != null)
+                        reliableTransaction.TransmitDone = true;
                     throw new ApplicationException("Could not find a SIP channel to send SIP Response to " + topViaHeader.ReceivedFromAddress + ".");
                 }
             }
         }
 
-        private void SendResponse(SIPChannel sipChannel, SIPResponse sipResponse)
+        private void SendResponse(SIPChannel sipChannel, SIPResponse sipResponse, SIPTransaction reliableTransaction)
         {
 
             if (m_sipChannels.Count == 0)
             {
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 throw new ApplicationException("No channels are configured in the SIP transport layer. The response could not be sent.");
             }
 
@@ -819,10 +918,14 @@ namespace SIPSorcery.SIP
 
             if (lookupResult.LookupError != null)
             {
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 throw new ApplicationException("Could not resolve destination for response.\n" + sipResponse.ToString());
             }
             else if (lookupResult.Pending)
             {
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
                 // Ignore this response transmission and wait for the transaction retransmit mechanism to try again when DNS will have hopefully resolved the end point.
                 return;
             }
@@ -832,47 +935,68 @@ namespace SIPSorcery.SIP
 
                 if (dstEndPoint != null && dstEndPoint.Address.Equals(BlackholeAddress))
                 {
+                    if (reliableTransaction != null)
+                        reliableTransaction.TransmitDone = true;
                     // Ignore packet, it's destined for the blackhole.
                     return;
                 }
                 else if (dstEndPoint != null)
                 {
-                    SendResponse(sipChannel, new SIPEndPoint(topVia.Transport, dstEndPoint.GetIPEndPoint(), dstEndPoint.Fqdn), sipResponse);
+                    SendResponse(sipChannel, new SIPEndPoint(topVia.Transport, dstEndPoint.GetIPEndPoint(), dstEndPoint.Fqdn), sipResponse, reliableTransaction);
                 }
                 else
                 {
+                    if (reliableTransaction != null)
+                        reliableTransaction.TransmitDone = true;
                     throw new ApplicationException("SendResponse could not send a response as no end point was resolved.\n" + sipResponse.ToString());
                 }
             }
         }
 
-        private void SendResponse(SIPChannel sipChannel, SIPEndPoint dstEndPoint, SIPResponse sipResponse)
+        private void SendResponse(SIPChannel sipChannel, SIPEndPoint dstEndPoint, SIPResponse sipResponse, SIPTransaction reliableTransaction)
         {
             try
             {
                 if (dstEndPoint != null && dstEndPoint.Address.Equals(BlackholeAddress))
                 {
+                    if (reliableTransaction != null)
+                        reliableTransaction.TransmitDone = true;
                     // Ignore packet, it's destined for the blackhole.
                     return;
                 }
 
                 if (m_sipChannels.Count == 0)
                 {
+                    if (reliableTransaction != null)
+                        reliableTransaction.TransmitDone = true;
                     throw new ApplicationException("No channels are configured in the SIP transport layer. The response could not be sent.");
                 }
 
                 FireSIPResponseOutBeforeSendEvent(sipChannel.SIPChannelEndPoint, dstEndPoint, ref sipResponse);
 
                 sipResponse.Header.ContentLength = (sipResponse.Body.NotNullOrBlank()) ? Encoding.UTF8.GetByteCount(sipResponse.Body) : 0;
-                sipChannel.Send(dstEndPoint.GetIPEndPoint(), Encoding.UTF8.GetBytes(sipResponse.ToString()));
-
-                FireSIPResponseOutTraceEvent(sipChannel.SIPChannelEndPoint, dstEndPoint, sipResponse);
+                sipChannel.Send(dstEndPoint.GetIPEndPoint(), Encoding.UTF8.GetBytes(sipResponse.ToString()),
+                    (done => OnSendResponseDone(done, reliableTransaction, sipChannel, dstEndPoint, sipResponse)),
+                    () => IsTransactionCanceled(reliableTransaction));
             }
             catch (ApplicationException appExcp)
             {
                 logger.Warn("ApplicationException SIPTransport SendResponse. " + appExcp.Message);
+                if (reliableTransaction != null)
+                    reliableTransaction.TransmitDone = true;
             }
         }
+
+        private void OnSendResponseDone(bool succeded, SIPTransaction reliableTransaction, SIPChannel channel, SIPEndPoint dstEndPoint, SIPResponse response)
+        {
+            if (succeded)
+                FireSIPResponseOutTraceEvent(channel.SIPChannelEndPoint, dstEndPoint, response);
+            if (reliableTransaction == null)
+                return;
+            reliableTransaction.LastTransmit = DateTime.Now;
+            reliableTransaction.TransmitDone = true;
+        }
+
 
         private void ProcessInMessage()
         {
@@ -1194,7 +1318,7 @@ namespace SIPSorcery.SIP
                                     transaction.FireTransactionTimedOut();
                                     completedTransactions.Add(transaction.TransactionId);
                                 }
-                                else
+                                else if (transaction.TransmitDone)
                                 {
                                     double nextTransmitMilliseconds = Math.Pow(2, transaction.Retransmits - 1) * m_t1;
                                     nextTransmitMilliseconds = (nextTransmitMilliseconds > m_t2) ? m_t2 : nextTransmitMilliseconds;
@@ -1204,6 +1328,7 @@ namespace SIPSorcery.SIP
                                     {
                                         transaction.Retransmits = transaction.Retransmits + 1;
                                         transaction.LastTransmit = DateTime.Now;
+                                        transaction.TransmitDone = false;
 
                                         if (transaction.TransactionType == SIPTransactionTypesEnum.Invite && transaction.TransactionState == SIPTransactionStatesEnum.Completed)
                                         {
@@ -1220,18 +1345,7 @@ namespace SIPSorcery.SIP
                                             //logger.Debug("Retransmit " + transaction.Retransmits + " for request " + transaction.TransactionRequest.Method + " " + transaction.TransactionRequest.URI.ToString() + ", last=" + DateTime.Now.Subtract(transaction.LastTransmit).TotalMilliseconds + "ms, first=" + DateTime.Now.Subtract(transaction.InitialTransmit).TotalMilliseconds + "ms.");
                                             try
                                             {
-                                                if (transaction.OutboundProxy != null)
-                                                {
-                                                    SendRequest(transaction.OutboundProxy, transaction.TransactionRequest);
-                                                }
-                                                else if (transaction.RemoteEndPoint != null)
-                                                {
-                                                    SendRequest(transaction.RemoteEndPoint, transaction.TransactionRequest);
-                                                }
-                                                else
-                                                {
-                                                    SendRequest(transaction.TransactionRequest);
-                                                }
+                                                SendRequest(transaction);
                                                 transaction.RequestRetransmit();
                                             }
                                             catch (Exception excp)
@@ -1241,6 +1355,7 @@ namespace SIPSorcery.SIP
                                                 transaction.DeliveryFailed = true;
                                                 transaction.TimedOutAt = DateTime.Now;
                                                 transaction.HasTimedOut = true;
+                                                transaction.TransmitDone = true;
                                                 transaction.FireTransactionTimedOut();
                                                 completedTransactions.Add(transaction.TransactionId);
                                             }
@@ -1476,7 +1591,7 @@ namespace SIPSorcery.SIP
                                                 //logger.Warn("SIPTransport responding with TooManyHops due to 0 MaxForwards.");
                                                 FireSIPBadRequestInTraceEvent(sipChannel.SIPChannelEndPoint, remoteEndPoint, "Zero MaxForwards on " + sipRequest.Method + " " + sipRequest.URI.ToString() + " from " + sipRequest.Header.From.FromURI.User + " " + remoteEndPoint.ToString(), SIPValidationFieldsEnum.Request, sipRequest.ToString());
                                                 SIPResponse tooManyHops = GetResponse(sipRequest, SIPResponseStatusCodesEnum.TooManyHops, null);
-                                                SendResponse(sipChannel, tooManyHops);
+                                                SendResponse(sipChannel, tooManyHops, null);
                                                 return;
                                             }
                                             /*else if (sipRequest.IsLoop(sipChannel.SIPChannelEndPoint.SocketEndPoint.Address.ToString(), sipChannel.SIPChannelEndPoint.SocketEndPoint.Port, sipRequest.CreateBranchId()))
@@ -1511,7 +1626,7 @@ namespace SIPSorcery.SIP
                                     {
                                         FireSIPBadRequestInTraceEvent(sipChannel.SIPChannelEndPoint, remoteEndPoint, sipRequestExcp.Message, sipRequestExcp.SIPErrorField, sipMessage.RawMessage);
                                         SIPResponse errorResponse = GetResponse(sipChannel.SIPChannelEndPoint, remoteEndPoint, sipRequestExcp.SIPResponseErrorCode, sipRequestExcp.Message);
-                                        SendResponse(sipChannel, errorResponse);
+                                        SendResponse(sipChannel, errorResponse, null);
                                     }
 
                                     #endregion

@@ -37,6 +37,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Cache;
 using System.Net.Security;
 using System.Security.Authentication;
 using System.Net.Sockets;
@@ -48,6 +49,7 @@ using System.Threading;
 using SIPSorcery.Sys;
 using log4net;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace SIPSorcery.SIP
 {
@@ -81,17 +83,76 @@ namespace SIPSorcery.SIP
         /// </summary>
         private readonly List<string> m_connectingSockets = new List<string>();
 
-        /// <summary>
-        /// Je Verbindung (Key) gibt es einen WaitHandle (Value). Hierdurch wird gewährleistet, dass sich mehrere Threads beim (1.) Verbindungsaufbau und (2.) beim Versand nicht überholen
-        /// und hierdurch Telegramm auf einer noch nicht vollständig geöffneten Verbindung versendet werden.
-        /// </summary>
-        private readonly Dictionary<string, AutoResetEvent> m_endpointsToEvent;
         private readonly object m_connectAndSendSync;
+        private readonly Dictionary<string, Queue<ITlsChannelJob>> m_endpointJobLists;
 
-        /// <summary>
-        /// Um zu gewährleisten, dass das verbindungsspezifische WaitHandle erst dann entfernt (Disposed) wird, wenn kein Thread auf dieses wartet, wurde die Anzahl an wartetenden Threads verwaltet.
-        /// </summary>
-        private readonly Dictionary<string, int> m_endpointsToCountOfWaitingThreads;
+        private interface ITlsChannelJob
+        {
+            void Execute();
+            void Abort();
+        }
+
+        private class JobSend : ITlsChannelJob
+        {
+            private Action<IPEndPoint, byte[], string, Action<bool>, Func<bool>> m_sendAction;
+            private IPEndPoint m_endPoint;
+            private byte[] m_buffer;
+            private string m_fqdn;
+            private Action<bool> m_onSendDone;
+            private Func<bool> m_isCanceled;
+
+            public JobSend(Action<IPEndPoint, byte[], string, Action<bool>, Func<bool>> a_sendAction, IPEndPoint a_endpoint, byte[] a_buffer, string a_fqdn, Action<bool> a_onSendDone, Func<bool> a_isCanceled)
+            {
+                m_sendAction = a_sendAction;
+                m_endPoint = a_endpoint;
+                m_buffer = a_buffer;
+                m_fqdn = a_fqdn;
+                m_onSendDone = a_onSendDone;
+                m_isCanceled = a_isCanceled;
+            }
+
+            public void Execute()
+            {
+                m_sendAction.Invoke(m_endPoint, m_buffer, m_fqdn, m_onSendDone, m_isCanceled);
+            }
+
+            public void Abort()
+            {
+                m_onSendDone?.Invoke(false);
+            }
+        }
+
+        private class JobAccept : ITlsChannelJob
+        {
+            private string m_endpointKey;
+            private IPEndPoint m_remotEndPoint;
+            private TcpClient m_tcpClient;
+            private Action<string, IPEndPoint, TcpClient> m_acceptAction;
+
+            public JobAccept(Action<string, IPEndPoint, TcpClient> a_acceptAction, string a_endpointKey, IPEndPoint a_remoteEndPoint, TcpClient a_tcpClient)
+            {
+                m_endpointKey = a_endpointKey;
+                m_remotEndPoint = a_remoteEndPoint;
+                m_tcpClient = a_tcpClient;
+                m_acceptAction = a_acceptAction;
+            }
+
+            public void Execute()
+            {
+                m_acceptAction.Invoke(m_endpointKey, m_remotEndPoint, m_tcpClient);
+            }
+
+            public void Abort()
+            {
+                try
+                {
+                    m_tcpClient.Close();
+                }
+                catch
+                {
+                }
+            }
+        }
 
         //private string m_certificatePath;
         private readonly X509Certificate2 m_serverCertificate;
@@ -147,8 +208,7 @@ namespace SIPSorcery.SIP
             m_outboundCertificateValidationCallback = outboundCertificateValidationCallback;
 
             m_connectAndSendSync = new object();
-            m_endpointsToEvent = new Dictionary<string, AutoResetEvent>();
-            m_endpointsToCountOfWaitingThreads = new Dictionary<string, int>();
+            m_endpointJobLists = new Dictionary<string, Queue<ITlsChannelJob>>();
 
             m_logDebug = logDebug;
             m_logError = logError;
@@ -221,70 +281,9 @@ namespace SIPSorcery.SIP
                         // Connected
                         SetHandleInformation(tcpClient.Client.Handle, HANDLE_FLAG_INHERIT, 0);
                         remoteEndPoint = (IPEndPoint)tcpClient.Client.RemoteEndPoint;
-
                         var endpointKey = remoteEndPoint.ToString();
-
-                        AutoResetEvent ev;
-                        lock (m_connectAndSendSync)
-                        {
-                            if (!m_endpointsToEvent.ContainsKey(endpointKey))
-                            {
-                                m_endpointsToEvent.Add(endpointKey, new AutoResetEvent(initialState: true));
-                            }
-
-                            if (!m_endpointsToCountOfWaitingThreads.ContainsKey(endpointKey))
-                            {
-                                m_endpointsToCountOfWaitingThreads.Add(endpointKey, 0);
-                            }
-
-                            ev = m_endpointsToEvent[endpointKey];
-                            m_endpointsToCountOfWaitingThreads[endpointKey] = m_endpointsToCountOfWaitingThreads[endpointKey] + 1;
-                        }
-
-                        //
-                        //  Wait until the last async operation (BeginAuthenticateAsServer => EndAuthenticateAsServer) and
-                        //  the modifications of the containers (m_connectingSockets, m_connectedSockets) are finished.
-                        //
-                        ev.WaitOne();
-
-                        bool startAuthentication = true;
-                        lock (m_connectedSockets)
-                        {
-                            if (m_connectingSockets.Contains(endpointKey) || m_connectedSockets.ContainsKey(endpointKey))
-                            {
-                                logger.Debug($"SIP TLS Channel refused from {endpointKey} because of existing or pending connection.");
-                                startAuthentication = false;
-                            }
-                            else
-                            {
-                                m_connectingSockets.Add(endpointKey);
-                            }
-                        }
-
-                        if (startAuthentication)
-                        {
-                            try
-                            {
-                                logger.Debug( "SIP TLS Channel connection accepted from " + remoteEndPoint + "." );
-
-                                var sslStream = new SslStream( tcpClient.GetStream(), false, ( sender, certificate, chain, errors ) => m_inboundCertificateValidationCallback( this, remoteEndPoint, certificate, chain, errors ) );
-
-                                var sipTlsConnection = new SIPConnection( this, tcpClient, sslStream, remoteEndPoint, SIPProtocolsEnum.tls, SIPConnectionsEnum.Listener, m_logDebug, m_logError );
-
-                                sslStream.BeginAuthenticateAsServer( m_serverCertificate, m_clientCertificateRequired, m_sslProtocols, m_checkCertificateRevocation, EndAuthenticateAsServer, sipTlsConnection );
-                            }
-                            finally
-                            {
-                                lock (m_connectedSockets)
-                                {
-                                    m_connectingSockets.Remove(remoteEndPoint.ToString());
-                                }
-                            }
-                        }
-                        else
-                        {
-                            tcpClient.Close();
-                        }
+                        var job = new JobAccept((key, endpoint, client) => StartAuthenticateAsServer(key, endpoint, client), endpointKey, remoteEndPoint, tcpClient);
+                        ExecuteJobOrQueueIt(endpointKey, job);
                     }
                     catch (Exception e)
                     {
@@ -292,7 +291,7 @@ namespace SIPSorcery.SIP
                         m_logError?.Invoke($"SIPTLSChannel Accept Connection Exception: {e}");
                         if (null != remoteEndPoint)
                         {
-                            SignalNextWaitingThreadAndPossibleRemoveWaitHandle(remoteEndPoint);
+                            FinishJobAndStartNextOne(remoteEndPoint);
                         }
                     }
                 }
@@ -306,13 +305,64 @@ namespace SIPSorcery.SIP
             }
         }
 
+        private void StartAuthenticateAsServer(string a_endpointKey, IPEndPoint a_remoteEndPoint, TcpClient a_tcpClient)
+        {
+            try
+            {
+                bool startAuthentication = true;
+                lock (m_connectedSockets)
+                {
+                    if (m_connectingSockets.Contains(a_endpointKey) || m_connectedSockets.ContainsKey(a_endpointKey))
+                    {
+                        logger.Debug($"SIP TLS Channel refused from {a_endpointKey} because of existing or pending connection.");
+                        startAuthentication = false;
+                    }
+                    else
+                    {
+                        m_connectingSockets.Add(a_endpointKey);
+                    }
+                }
+
+                if (startAuthentication)
+                {
+                    try
+                    {
+                        logger.Debug("SIP TLS Channel connection accepted from " + a_remoteEndPoint + ".");
+
+                        var sslStream = new SslStream(a_tcpClient.GetStream(), false, (sender, certificate, chain, errors) => m_inboundCertificateValidationCallback(this, a_remoteEndPoint, certificate, chain, errors));
+                        var sipTlsConnection = new SIPConnection(this, a_tcpClient, sslStream, a_remoteEndPoint, SIPProtocolsEnum.tls, SIPConnectionsEnum.Listener, m_logDebug, m_logError);
+                        sslStream.BeginAuthenticateAsServer(m_serverCertificate, m_clientCertificateRequired, m_sslProtocols, m_checkCertificateRevocation, EndAuthenticateAsServer, sipTlsConnection);
+                    }
+                    catch
+                    {
+                        lock (m_connectedSockets)
+                        {
+                            m_connectingSockets.Remove(a_remoteEndPoint.ToString());
+                        }
+
+                        throw;
+                    }
+                }
+                else
+                {
+                    a_tcpClient.Close();
+                    FinishJobAndStartNextOne(a_remoteEndPoint);
+                }
+            }
+            catch (Exception excp)
+            {
+                logger.Error("Exception SIPTLSChannel StartAuthenticateAsServer. " + excp);
+                m_logError?.Invoke($"Exception SIPTLSChannel StartAuthenticateAsServer: {excp}");
+                FinishJobAndStartNextOne(a_remoteEndPoint);
+            }
+        }
+
         public void EndAuthenticateAsServer(IAsyncResult ar)
         {
             SIPConnection sipTlsConnection = (SIPConnection)ar.AsyncState;
             try
             {
                 var sslStream = (SslStream) sipTlsConnection.SIPStream;
-
                 sslStream.EndAuthenticateAsServer(ar);
 
                 const int fiveSeconds = 5000;
@@ -339,7 +389,7 @@ namespace SIPSorcery.SIP
             }
             finally
             {
-                SignalNextWaitingThreadAndPossibleRemoveWaitHandle(sipTlsConnection.RemoteEndPoint);
+                FinishJobAndStartNextOne(sipTlsConnection.RemoteEndPoint);
             }
 
             FireConnectionOpened(sipTlsConnection);
@@ -388,21 +438,37 @@ namespace SIPSorcery.SIP
 
         public override void Send(IPEndPoint destinationEndPoint, string message)
         {
+            Send(destinationEndPoint, message, null, null);
+        }
+
+        public override void Send(IPEndPoint destinationEndPoint, string message, Action<bool> onSendDone, Func<bool> isCanceled)
+        {
             byte[] messageBuffer = Encoding.UTF8.GetBytes(message);
-            Send(destinationEndPoint, messageBuffer);
+            Send(destinationEndPoint, messageBuffer, onSendDone, isCanceled);
         }
 
         public override void Send(IPEndPoint dstEndPoint, byte[] buffer)
         {
-            Send(dstEndPoint, buffer, null);
+            Send(dstEndPoint, buffer, null, null);
+        }
+
+        public override void Send(IPEndPoint dstEndPoint, byte[] buffer, Action<bool> onSendDone, Func<bool> isCanceled)
+        {
+            Send(dstEndPoint, buffer, (string)null, onSendDone, isCanceled);
         }
 
         public override void Send(IPEndPoint dstEndPoint, byte[] buffer, string serverCertificateName)
+        {
+            Send(dstEndPoint, buffer, serverCertificateName, null, null);
+        }
+
+        public override void Send(IPEndPoint dstEndPoint, byte[] buffer, string serverCertificateName, Action<bool> onSendDone, Func<bool> isCanceled)
         {
             try
             {
                 if (buffer == null)
                 {
+                    onSendDone?.Invoke(false);
                     throw new ApplicationException("An empty buffer was specified to Send in SIPTLSChannel.");
                 }
 
@@ -412,46 +478,59 @@ namespace SIPSorcery.SIP
                 {
                     logger.Error($"SIPTLSChannel blocked Send to {endpointKey} as it was identified as a locally hosted TCP socket.\r\n{Encoding.UTF8.GetString(buffer)}");
                     m_logError?.Invoke($"SIPTLSChannel blocked Send to {{endpointKey}} as it was identified as a locally hosted TCP socket.\\r\\n{{Encoding.UTF8.GetString(buffer)}}");
+                    onSendDone?.Invoke(false);
                     throw new ApplicationException("A Send call was made in SIPTLSChannel to send to another local TCP socket.");
                 }
 
-                SIPConnection sipTLSClient = null;
-
-                AutoResetEvent ev;
-                lock (m_connectAndSendSync)
+                if (serverCertificateName.IsNullOrBlank())
                 {
-                    if (!m_endpointsToEvent.ContainsKey(endpointKey))
+                    lock (m_connectedSockets)
                     {
-                        m_endpointsToEvent.Add(endpointKey, new AutoResetEvent(initialState:true));
+                        if (!m_connectedSockets.ContainsKey(endpointKey))
+                        {
+                            m_logError?.Invoke("The SIP TLS Channel must be provided with the name of the expected server certificate, please use alternative method.");
+                            onSendDone?.Invoke(false);
+                            throw new ApplicationException("The SIP TLS Channel must be provided with the name of the expected server certificate, please use alternative method.");
+                        }
                     }
-
-                    if (!m_endpointsToCountOfWaitingThreads.ContainsKey(endpointKey))
-                    {
-                        m_endpointsToCountOfWaitingThreads.Add(endpointKey, 0);
-                    }
-
-                    ev = m_endpointsToEvent[endpointKey];
-                    m_endpointsToCountOfWaitingThreads[endpointKey] = m_endpointsToCountOfWaitingThreads[endpointKey] + 1;
                 }
 
-                //
-                // Warten, bis die letzte asynchrone Operationen (BeginConnect bzw. BeginWrite) und
-                // die Modifizierungen an den Containern (m_connectedSockets, m_connectingSockets) abgeschlossen ist.
-                //
-                ev.WaitOne();
+                var job = new JobSend((endpPoint, buf, cert, done, canceled) => DoSend(endpPoint, buf, cert, done, canceled), dstEndPoint, buffer, serverCertificateName, onSendDone, isCanceled);
+                ExecuteJobOrQueueIt(dstEndPoint.ToString(), job);
+            }
+            catch (Exception excp)
+            {
+                logger.Error("Exception (" + excp.GetType() + ") SIPTLSChannel Send (sendto=>" + dstEndPoint + "). " + excp);
+                m_logError?.Invoke($"SIPTLSChannel.Send-Exception-Endpoint:'{dstEndPoint}'-Exception:{excp}");
+                onSendDone?.Invoke(false);
+                throw;
+            }
+        }
+
+        private void DoSend(IPEndPoint dstEndPoint, byte[] buffer, string serverCertificateName, Action<bool> onSendDone, Func<bool> isCanceled)
+        {
+            try
+            {
+                if (isCanceled != null && isCanceled.Invoke())
+                {
+                    onSendDone?.Invoke(false);
+                    logger.Warn("A SIPTLSChannel write operation to " + dstEndPoint + " was dropped as the underlaying transaction has timedout.");
+                    m_logError?.Invoke("A SIPTLSChannel write operation to " + dstEndPoint + " was dropped as the underlaying transaction has timedout.");
+                    FinishJobAndStartNextOne(dstEndPoint);
+                    return;
+                }
+
+                SIPConnection sipTLSClient = null;
+                var endpointKey = dstEndPoint.ToString();
 
                 lock (m_connectedSockets)
                 {
-                    if (m_connectedSockets.ContainsKey(endpointKey))
-                    {
-                        sipTLSClient = m_connectedSockets[endpointKey];
-                    }
+                    m_connectedSockets.TryGetValue(endpointKey, out sipTLSClient);
                 }
 
                 //
                 // Verbindung ist bereits aufgebaut => Telegramm senden.
                 //
-                bool isSent = false;
                 if (null != sipTLSClient) 
                 {
                     try
@@ -463,15 +542,17 @@ namespace SIPSorcery.SIP
                             var id = Interlocked.Increment(ref m_invokeAsyncOperationIdCounter);
 
                             sipTLSClient.OperationId = id;
-                            sipTLSClient.SIPStream.BeginWrite(buffer, 0, buffer.Length, EndSend, sipTLSClient);
-                            isSent = true;
+                            sipTLSClient.SIPStream.BeginWrite(buffer, 0, buffer.Length, EndSend, new object[]{sipTLSClient, onSendDone});
                             sipTLSClient.LastTransmission = DateTime.Now;
+                            return;
                         }
-                        else
-                        {
-                            logger.Warn("A SIPTLSChannel write operation to " + dstEndPoint + " was dropped as the stream was null or could not be written to.");
-                            m_logError?.Invoke("A SIPTLSChannel write operation to " + dstEndPoint + " was dropped as the stream was null or could not be written to.");
-                        }
+
+                        onSendDone?.Invoke(false);
+
+                        logger.Warn("A SIPTLSChannel write operation to " + dstEndPoint + " was dropped as the stream was null or could not be written to.");
+                        m_logError?.Invoke("A SIPTLSChannel write operation to " + dstEndPoint + " was dropped as the stream was null or could not be written to.");
+                        FinishJobAndStartNextOne(dstEndPoint);
+                        return;
                     }
                     catch (SocketException)
                     {
@@ -487,16 +568,13 @@ namespace SIPSorcery.SIP
                     }
                 }
 
-                if (isSent || null != sipTLSClient)
-                {
-                    return;
-                }
-                
                 if (serverCertificateName.IsNullOrBlank())
                 {
+                    onSendDone?.Invoke(false);
+
                     m_logError?.Invoke("The SIP TLS Channel must be provided with the name of the expected server certificate, please use alternative method.");
-                    SignalNextWaitingThreadAndPossibleRemoveWaitHandle(dstEndPoint);
-                    throw new ApplicationException("The SIP TLS Channel must be provided with the name of the expected server certificate, please use alternative method.");
+                    FinishJobAndStartNextOne(dstEndPoint);
+                    return;
                 }
 
                 bool tryConnect = false;
@@ -518,36 +596,42 @@ namespace SIPSorcery.SIP
                         tcpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, false);
 
                         tcpClient.Client.Bind(CreateEndpoint());
-                        tcpClient.BeginConnect(dstEndPoint.Address, dstEndPoint.Port, EndConnect, new object[] {tcpClient, dstEndPoint, buffer, serverCertificateName});
+                        tcpClient.BeginConnect(dstEndPoint.Address, dstEndPoint.Port, EndConnect, new object[] {tcpClient, dstEndPoint, buffer, serverCertificateName, onSendDone });
                     }
                     catch (Exception e)
                     {
-                        logger.Error("Exception (" + e.GetType() + ") SIPTLSChannel Send (sendto=>" + dstEndPoint + "); TcpClient.Bind or TcpClient.BeginConnect. " + e);
-                        m_logError?.Invoke($"SIPTLSChannel.Send-Exception during invoking tcpClient.BeginConnect-Endpoint:'{endpointKey}'-Exception:{e}");
+                        onSendDone?.Invoke(false);
 
-                        SignalNextWaitingThreadAndPossibleRemoveWaitHandle(dstEndPoint);
-                    }
-                    finally
-                    {
                         lock (m_connectedSockets)
                         {
                             m_connectingSockets.Remove(endpointKey);
                         }
+
+                        logger.Error("Exception (" + e.GetType() + ") SIPTLSChannel Send (sendto=>" + dstEndPoint + "); TcpClient.Bind or TcpClient.BeginConnect. " + e);
+                        m_logError?.Invoke($"SIPTLSChannel.Send-Exception during invoking tcpClient.BeginConnect-Endpoint:'{endpointKey}'-Exception:{e}");
+
+                        FinishJobAndStartNextOne(dstEndPoint);
                     }
                 }
                 else
                 {
+                    onSendDone?.Invoke(false);
+
                     logger.Warn("Could not send SIP packet to TLS " + dstEndPoint + " and another connection was already in progress so dropping message.");
                     m_logError?.Invoke($"Could not send SIP packet to TLS {dstEndPoint} and another connection was already in progress so dropping message.");
+                    FinishJobAndStartNextOne(dstEndPoint);
                 }
             }
             catch (Exception excp)
             {
-                logger.Error("Exception (" + excp.GetType() + ") SIPTLSChannel Send (sendto=>" + dstEndPoint + "). " + excp);
+                onSendDone?.Invoke(false);
+
+                logger.Error("Exception (" + excp.GetType() + ") SIPTLSChannel DoSend (sendto=>" + dstEndPoint + "). " + excp);
                 m_logError?.Invoke($"SIPTLSChannel.Send-Exception-Endpoint:'{dstEndPoint}'-Exception:{excp}");
-                throw;
+                FinishJobAndStartNextOne(dstEndPoint);
             }
         }
+
 
         private IPEndPoint CreateEndpoint()
         {
@@ -562,21 +646,24 @@ namespace SIPSorcery.SIP
 
         private void EndSend(IAsyncResult ar)
         {
+            object[] stateObj = (object[])ar.AsyncState;
+            SIPConnection sipConnection = (SIPConnection)stateObj[0];
+            Action<bool> onSendDone = (Action<bool>)stateObj[1];
             IPEndPoint dstEndpoint = null;
             long? operationId = -1;
             try
             {
-                SIPConnection sipConnection = (SIPConnection) ar.AsyncState;
-
                 operationId = sipConnection.OperationId;
-
                 dstEndpoint = sipConnection.RemoteEndPoint;
                 sipConnection.SIPStream.EndWrite(ar);
+                onSendDone?.Invoke(true);
 
                 OnSendComplete(EventArgs.Empty);
             }
             catch (Exception excp)
             {
+                onSendDone?.Invoke(false);
+
                 logger.Error("Exception EndSend. " + excp);
                 m_logError(operationId.HasValue
                     ? $"SIPTLSChannel.EndSend Exception with OperationId '{operationId.Value}'. Exception: {excp}"
@@ -584,7 +671,7 @@ namespace SIPSorcery.SIP
             }
             finally
             {
-                SignalNextWaitingThreadAndPossibleRemoveWaitHandle(dstEndpoint);
+                FinishJobAndStartNextOne(dstEndpoint);
             }
         }
 
@@ -600,6 +687,7 @@ namespace SIPSorcery.SIP
             IPEndPoint dstEndPoint = (IPEndPoint)stateObj[1];
             byte[] buffer = (byte[])stateObj[2];
             string serverCN = (string)stateObj[3];
+            Action<bool> onSendDone = (Action<bool>) stateObj[4];
 
             try
             {
@@ -610,33 +698,11 @@ namespace SIPSorcery.SIP
 
                 SIPConnection callerConnection = new SIPConnection(this, tcpClient, sslStream, dstEndPoint, SIPProtocolsEnum.tls, SIPConnectionsEnum.Caller, m_logDebug, m_logError);
 
-                sslStream.BeginAuthenticateAsClient(serverCN, new X509Certificate2Collection() { m_serverCertificate }, m_sslProtocols, m_checkCertificateRevocation, EndAuthenticateAsClient, new object[] { tcpClient, dstEndPoint, buffer, callerConnection });
-
-                #region old
-                //sslStream.AuthenticateAsClient(serverCN);
-
-                //if (tcpClient != null && tcpClient.Connected)
-                //{
-                //    SIPConnection callerConnection = new SIPConnection(this, sslStream, dstEndPoint, SIPProtocolsEnum.tls, SIPConnectionsEnum.Caller);
-                //    m_connectedSockets.Add(dstEndPoint.ToString(), callerConnection);
-
-                //    callerConnection.SIPSocketDisconnected += SIPTLSSocketDisconnected;
-                //    callerConnection.SIPMessageReceived += SIPTLSMessageReceived;
-                //    //byte[] receiveBuffer = new byte[MaxSIPTCPMessageSize];
-                //    callerConnection.SIPStream.BeginRead(callerConnection.SocketBuffer, 0, MaxSIPTCPMessageSize, new AsyncCallback(ReceiveCallback), callerConnection);
-
-                //    logger.Debug("Established TLS connection to " + dstEndPoint + ".");
-
-                //    callerConnection.SIPStream.BeginWrite(buffer, 0, buffer.Length, EndSend, callerConnection);
-                //}
-                //else
-                //{
-                //    logger.Warn("Could not establish TLS connection to " + dstEndPoint + ".");
-                //}
-                #endregion
+                sslStream.BeginAuthenticateAsClient(serverCN, new X509Certificate2Collection() { m_serverCertificate }, m_sslProtocols, m_checkCertificateRevocation, EndAuthenticateAsClient, new object[] { tcpClient, dstEndPoint, buffer, callerConnection, onSendDone });
             }
             catch (Exception excp)
             {
+                onSendDone?.Invoke(false);
                 logger.Error("Exception SIPTLSChannel EndConnect. " + excp);
                 m_logError?.Invoke("Exception SIPTLSChannel EndConnect. " + excp);
 
@@ -658,7 +724,7 @@ namespace SIPSorcery.SIP
                     }
                 }
 
-                SignalNextWaitingThreadAndPossibleRemoveWaitHandle(dstEndPoint);
+                FinishJobAndStartNextOne(dstEndPoint);
             }
         }
 
@@ -669,6 +735,7 @@ namespace SIPSorcery.SIP
             IPEndPoint dstEndPoint = (IPEndPoint) stateObj[1];
             byte[] buffer = (byte[]) stateObj[2];
             SIPConnection callerConnection = (SIPConnection) stateObj[3];
+            Action<bool> onSendDone = (Action<bool>) stateObj[4];
             try
             {
                 SslStream sslStream = (SslStream) callerConnection.SIPStream;
@@ -686,13 +753,24 @@ namespace SIPSorcery.SIP
                 }
                 else
                 {
+                    onSendDone?.Invoke(false);
+
                     logger.Warn("Could not establish TLS connection to " + callerConnection.RemoteEndPoint + ".");
                     m_logError?.Invoke("Could not establish TLS connection to " + callerConnection.RemoteEndPoint + ".");
+
+                    lock (m_connectedSockets)
+                    {
+                        m_connectingSockets.Remove(dstEndPoint.ToString());
+                    }
+
+                    FinishJobAndStartNextOne(dstEndPoint);
                     return;
                 }
             }
             catch (Exception excp)
             {
+                onSendDone?.Invoke(false);
+
                 logger.Error("Exception SIPTLSChannel EndAuthenticateAsClient. " + excp);
                 m_logError?.Invoke("Exception SIPTLSChannel EndAuthenticateAsClient. " + excp);
 
@@ -701,7 +779,7 @@ namespace SIPSorcery.SIP
                     m_connectingSockets.Remove(dstEndPoint.ToString());
                 }
 
-                SignalNextWaitingThreadAndPossibleRemoveWaitHandle(dstEndPoint);
+                FinishJobAndStartNextOne(dstEndPoint);
                 return;
             }
 
@@ -716,78 +794,69 @@ namespace SIPSorcery.SIP
 
                 logger.Debug("Established TLS connection to " + callerConnection.RemoteEndPoint + ".");
 
-                callerConnection.SIPStream.BeginWrite(buffer, 0, buffer.Length, EndSend, callerConnection);
+                callerConnection.SIPStream.BeginWrite(buffer, 0, buffer.Length, EndSend, new object[]{callerConnection, onSendDone});
             }
             catch (Exception excp)
             {
-                SignalNextWaitingThreadAndPossibleRemoveWaitHandle(dstEndPoint);
+                onSendDone?.Invoke(false);
+
+                FinishJobAndStartNextOne(dstEndPoint);
                 logger.Error("Exception SIPTLSChannel EndAuthenticateAsClient. BeginRead/BeginWrite" + excp);
                 m_logError?.Invoke("Exception SIPTLSChannel EndAuthenticateAsClient. BeginRead/BeginWrite" + excp);
             }
         }
 
-        private void SignalNextWaitingThreadAndPossibleRemoveWaitHandle(IPEndPoint a_dstEndPoint, [CallerMemberName] string a_memberName = "")
+
+        private void ExecuteJobOrQueueIt(string a_endpointKey, ITlsChannelJob a_job)
         {
-            try
+            bool execute;
+            lock (m_connectAndSendSync)
             {
-                lock (m_connectAndSendSync)
+                if (Closed)
                 {
-                    var key = a_dstEndPoint.ToString();
-
-                    int waitingThreadsCount = DecrementWaitingThreadsCounter(key);
-
-                    m_endpointsToEvent[key].Set();
-
-                    if (AreThreadsWaiting(waitingThreadsCount))
-                    {
-                        return;
-                    }
-
-                    lock (m_connectedSockets)
-                    {
-                        if (IsSocketInUse(key))
-                        {
-                            return;
-                        }
-
-                        DisposeWaitHandle(key);
-                    }
+                    a_job.Abort();
+                    return;
                 }
+
+                Queue<ITlsChannelJob> endpointQueue;
+
+                if (!m_endpointJobLists.TryGetValue(a_endpointKey, out endpointQueue))
+                {
+                    endpointQueue = new Queue<ITlsChannelJob>();
+                    m_endpointJobLists.Add(a_endpointKey, endpointQueue);
+                }
+
+                execute = endpointQueue.Count == 0;
+                endpointQueue.Enqueue(a_job);
             }
-            catch (Exception e)
+            if (execute)
+                a_job.Execute();
+        }
+
+        private void FinishJobAndStartNextOne(IPEndPoint a_dstEndPoint)
+        {
+            ITlsChannelJob nextJob = null;
+            lock (m_connectAndSendSync)
             {
-                logger.Error($"SIPTLSChannel.{a_memberName} Signaling next Thread Exception: {e}");
+                if (!m_endpointJobLists.TryGetValue(a_dstEndPoint.ToString(), out var endpointQueue)
+                    || (endpointQueue.Count == 0))
+                    return;
+
+                endpointQueue.Dequeue();
+                if (endpointQueue.Count != 0)
+                    nextJob = endpointQueue.Peek();
             }
-        }
 
-        private int DecrementWaitingThreadsCounter(string a_key)
-        {
-            m_endpointsToCountOfWaitingThreads[a_key] = m_endpointsToCountOfWaitingThreads[a_key] - 1;
-            return m_endpointsToCountOfWaitingThreads[a_key];
-        }
-
-        private bool AreThreadsWaiting(int a_countWaitingThreads)
-        {
-            return a_countWaitingThreads > 0;
-        }
-
-        private bool IsSocketInUse(string a_key)
-        {
-            bool isSocketConnecting = m_connectingSockets.Any(x => x == a_key);
-            bool isSocketConnected = m_connectedSockets.ContainsKey(a_key);
-
-            return isSocketConnecting || isSocketConnected;
-        }
-
-        private void DisposeWaitHandle(string a_key)
-        {
-            if (!m_endpointsToEvent.TryGetValue(a_key, out var e))
-            {
+            if (Closed)
                 return;
+
+            if (nextJob != null)
+            {
+                Task.Run(nextJob.Execute);
             }
-            e.Dispose();
-            m_endpointsToEvent.Remove(a_key);
         }
+
+
 
         protected override Dictionary<string, SIPConnection> GetConnectionsList()
         {
@@ -808,14 +877,27 @@ namespace SIPSorcery.SIP
             try
             {
                 logger.Debug("TLS socket from " + remoteEndPoint + " disconnected.");
+                var key = remoteEndPoint.ToString();
 
-                var k = remoteEndPoint.ToString();
+                lock (m_connectAndSendSync)
+                {
+                    if (m_endpointJobLists.TryGetValue(key, out var endpointQueue))
+                    {
+                        while (endpointQueue.Count != 0)
+                        {
+                            var job = endpointQueue.Dequeue();
+                            job.Abort();
+                        }
+
+                        m_endpointJobLists.Remove(key);
+                    }
+                }
 
                 lock (m_connectedSockets)
                 {
-                    m_connectedSockets.TryGetValue(k, out closedConnection);
-                    m_connectedSockets.Remove(k);
-                    m_connectingSockets.Remove(k);
+                    m_connectedSockets.TryGetValue(key, out closedConnection);
+                    m_connectedSockets.Remove(key);
+                    m_connectingSockets.Remove(key);
                 }
             }
             catch (Exception excp)
@@ -982,6 +1064,18 @@ namespace SIPSorcery.SIP
                 m_logDebug?.Invoke("Closing SIP TLS Channel " + SIPChannelEndPoint + ".");
 
                 Closed = true;
+
+                lock (m_connectAndSendSync)
+                {
+                    foreach (var endpointJobList in m_endpointJobLists)
+                    {
+                        while (endpointJobList.Value.Count != 0)
+                        {
+                            var job = endpointJobList.Value.Dequeue();
+                            job.Abort();
+                        }
+                    }
+                }
 
                 lock (m_connectedSockets)
                 {

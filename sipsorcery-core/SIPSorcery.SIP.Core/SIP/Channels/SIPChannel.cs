@@ -34,6 +34,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Eventing.Reader;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -106,8 +107,68 @@ namespace SIPSorcery.SIP
         public SIPMessageReceivedDelegate SIPMessageReceived;
 
         public abstract void Send(IPEndPoint destinationEndPoint, string message);
+
+        public virtual void Send(IPEndPoint destinationEndPoint, string message, Action<bool> onSendDone, Func<bool> isCanceled)
+        {
+            try
+            {
+                if (isCanceled == null || !isCanceled.Invoke())
+                {
+                    Send(destinationEndPoint, message);
+                    onSendDone?.Invoke(true);
+                }
+                else
+                    onSendDone?.Invoke(false);
+            }
+            catch
+            {
+                onSendDone?.Invoke(false);
+                throw;
+            }
+        }
+
         public abstract void Send(IPEndPoint destinationEndPoint, byte[] buffer);
+
+        public virtual void Send(IPEndPoint destinationEndPoint, byte[] buffer, Action<bool> onSendDone, Func<bool> isCanceled)
+        {
+            try
+            {
+                if (isCanceled == null || !isCanceled.Invoke())
+                {
+                    Send(destinationEndPoint, buffer);
+                    onSendDone?.Invoke(true);
+                }
+                else
+                    onSendDone?.Invoke(false);
+            }
+            catch
+            {
+                onSendDone?.Invoke(false);
+                throw;
+            }
+        }
+
         public abstract void Send(IPEndPoint destinationEndPoint, byte[] buffer, string serverCertificateName);
+
+        public virtual void Send(IPEndPoint destinationEndPoint, byte[] buffer, string serverCertificateName, Action<bool> onSendDone, Func<bool> isCanceled)
+        {
+            try
+            {
+                if (isCanceled == null || !isCanceled.Invoke())
+                {
+                    Send(destinationEndPoint, buffer, serverCertificateName);
+                    onSendDone?.Invoke(true);
+                }
+                else
+                    onSendDone?.Invoke(false);
+            }
+            catch
+            {
+                onSendDone?.Invoke(false);
+                throw;
+            }
+        }
+
         public abstract void Close();
         public abstract bool IsConnectionEstablished(IPEndPoint remoteEndPoint);
         protected abstract Dictionary<string, SIPConnection> GetConnectionsList();

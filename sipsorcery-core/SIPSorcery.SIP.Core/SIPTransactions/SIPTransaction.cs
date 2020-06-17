@@ -122,6 +122,7 @@ namespace SIPSorcery.SIP
 
         public int Retransmits = 0;
         public int AckRetransmits = 0;
+        public bool TransmitDone = true;
         public DateTime InitialTransmit = DateTime.MinValue;
         public DateTime LastTransmit = DateTime.MinValue;
         public bool DeliveryPending = true;
@@ -381,9 +382,9 @@ namespace SIPSorcery.SIP
             {
                 if (TransactionFinalResponse != null && TransactionState != SIPTransactionStatesEnum.Confirmed)
                 {
-                    m_sipTransport.SendResponse(TransactionFinalResponse);
                     Retransmits += 1;
                     LastTransmit = DateTime.Now;
+                    m_sipTransport.SendResponse(TransactionFinalResponse, this);
                     ResponseRetransmit();
                 }
             }

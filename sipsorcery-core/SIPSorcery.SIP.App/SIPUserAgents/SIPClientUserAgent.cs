@@ -940,6 +940,12 @@ namespace SIPSorcery.SIP.App
                                 inviteRequest.Header.Contact = customContactHeader;
                             }
                         }
+                        else if (customHeader.Trim().StartsWith(SIPHeaders.SIP_HEADER_SUPPORTED + ":"))
+                        {
+                            var customSupportedHeader = customHeader.Substring(customHeader.IndexOf(":") + 1).Trim();
+
+                            inviteRequest.Header.Supported = customSupportedHeader;
+                        }
                         else
                         {
                             inviteRequest.Header.UnknownHeaders.Add(customHeader);
