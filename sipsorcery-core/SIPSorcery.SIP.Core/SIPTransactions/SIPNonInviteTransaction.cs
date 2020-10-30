@@ -51,8 +51,8 @@ namespace SIPSorcery.SIP
         public event SIPTransactionRequestReceivedDelegate NonInviteRequestReceived;
         public event SIPTransactionRequestRetransmitDelegate NonInviteTransactionRequestRetransmit;
 
-        internal SIPNonInviteTransaction(SIPTransport sipTransport, SIPRequest sipRequest, SIPEndPoint dstEndPoint, SIPEndPoint localSIPEndPoint, SIPEndPoint outboundProxy)
-            : base(sipTransport, sipRequest, dstEndPoint, localSIPEndPoint, outboundProxy)
+        internal SIPNonInviteTransaction(SIPTransport sipTransport, SIPRequest sipRequest, SIPEndPoint dstEndPoint, SIPEndPoint localSIPEndPoint, SIPEndPoint outboundProxy, int sipTimer1 = SIPTimings.T1, int sipTimer2 = SIPTimings.T2)
+            : base(sipTransport, sipRequest, dstEndPoint, localSIPEndPoint, outboundProxy, sipTimer1, sipTimer2)
         {
             TransactionType = SIPTransactionTypesEnum.NonInvite;
             TransactionRequestReceived += SIPNonInviteTransaction_TransactionRequestReceived;

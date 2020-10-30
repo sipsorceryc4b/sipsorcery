@@ -114,8 +114,21 @@ namespace SIPSorcery.SIP
     {
         protected static ILog logger = AssemblyState.logger;
 
-        protected static readonly int m_t1 = SIPTimings.T1;                     // SIP Timer T1 in milliseconds.
-        protected static readonly int m_t6 = SIPTimings.T6;                     // SIP Timer T1 in milliseconds.
+        /// <summary>
+        /// Value of the SIP defined timer T1 in milliseconds and is the time for the first retransmit.
+        /// </summary>
+        public int T1 { get; }
+
+        /// <summary>
+        /// Value of the SIP defined timer T2 in milliseconds and is the maximum time between retransmits.
+        /// </summary>
+        public int T2 { get; }
+
+        /// <summary>
+        /// Value of the SIP defined timer T6 in milliseconds and is the period after which a transaction has timed out.
+        /// </summary>
+        public int T6 { get; }
+
         protected static readonly int m_maxRingTime = SIPTimings.MAX_RING_TIME; // Max time an INVITE will be left ringing for (typically 10 mins).    
 
         private static string m_crLF = SIPConstants.CRLF;
@@ -216,12 +229,17 @@ namespace SIPSorcery.SIP
         /// <param name="dstEndPoint">The socket the at the remote end of the transaction and which transaction messages will be sent to.</param>
         /// <param name="localSIPEndPoint">The socket that should be used as the send from socket for communications on this transaction. Typically this will
         /// be the socket the initial request was received on.</param>
+        /// <param name="outboundProxy"></param>
+        /// <param name="sipTimer1">Value of the SIP defined timer T1 in milliseconds and is the time for the first retransmit.</param>
+        /// <param name="sipTimer2">Value of the SIP defined timer T2 in milliseconds and is the maximum time between retransmits.</param>
         protected SIPTransaction(
             SIPTransport sipTransport,
             SIPRequest transactionRequest,
             SIPEndPoint dstEndPoint,
             SIPEndPoint localSIPEndPoint,
-            SIPEndPoint outboundProxy)
+            SIPEndPoint outboundProxy,
+            int sipTimer1 = SIPTimings.T1,
+            int sipTimer2 = SIPTimings.T2)
         {
             try
             {
@@ -259,6 +277,9 @@ namespace SIPSorcery.SIP
                 RemoteEndPoint = dstEndPoint;
                 LocalSIPEndPoint = localSIPEndPoint;
                 OutboundProxy = outboundProxy;
+                T1 = sipTimer1;
+                T2 = sipTimer2;
+                T6 = 64 * T1;
             }
             catch (Exception excp)
             {

@@ -94,12 +94,12 @@ namespace SIPSorcery.SIP
 
         private class JobSend : ITlsChannelJob
         {
-            private Action<IPEndPoint, byte[], string, Action<bool>, Func<bool>> m_sendAction;
-            private IPEndPoint m_endPoint;
-            private byte[] m_buffer;
-            private string m_fqdn;
-            private Action<bool> m_onSendDone;
-            private Func<bool> m_isCanceled;
+            private readonly Action<IPEndPoint, byte[], string, Action<bool>, Func<bool>> m_sendAction;
+            private readonly IPEndPoint m_endPoint;
+            private readonly byte[] m_buffer;
+            private readonly string m_fqdn;
+            private readonly Action<bool> m_onSendDone;
+            private readonly Func<bool> m_isCanceled;
 
             public JobSend(Action<IPEndPoint, byte[], string, Action<bool>, Func<bool>> a_sendAction, IPEndPoint a_endpoint, byte[] a_buffer, string a_fqdn, Action<bool> a_onSendDone, Func<bool> a_isCanceled)
             {
@@ -124,10 +124,10 @@ namespace SIPSorcery.SIP
 
         private class JobAccept : ITlsChannelJob
         {
-            private string m_endpointKey;
-            private IPEndPoint m_remotEndPoint;
-            private TcpClient m_tcpClient;
-            private Action<string, IPEndPoint, TcpClient> m_acceptAction;
+            private readonly string m_endpointKey;
+            private readonly IPEndPoint m_remotEndPoint;
+            private readonly TcpClient m_tcpClient;
+            private readonly Action<string, IPEndPoint, TcpClient> m_acceptAction;
 
             public JobAccept(Action<string, IPEndPoint, TcpClient> a_acceptAction, string a_endpointKey, IPEndPoint a_remoteEndPoint, TcpClient a_tcpClient)
             {
@@ -590,9 +590,10 @@ namespace SIPSorcery.SIP
                 if (tryConnect)
                 {
                     logger.Debug("Attempting to establish TLS connection to " + dstEndPoint + ".");
+                    TcpClient tcpClient = null;
                     try
                     {
-                        TcpClient tcpClient = new TcpClient();
+                        tcpClient = new TcpClient();
                         tcpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, false);
 
                         tcpClient.Client.Bind(CreateEndpoint());
@@ -601,6 +602,7 @@ namespace SIPSorcery.SIP
                     catch (Exception e)
                     {
                         onSendDone?.Invoke(false);
+                        tcpClient?.Dispose();
 
                         lock (m_connectedSockets)
                         {
@@ -818,9 +820,7 @@ namespace SIPSorcery.SIP
                     return;
                 }
 
-                Queue<ITlsChannelJob> endpointQueue;
-
-                if (!m_endpointJobLists.TryGetValue(a_endpointKey, out endpointQueue))
+                if (!m_endpointJobLists.TryGetValue(a_endpointKey, out var endpointQueue))
                 {
                     endpointQueue = new Queue<ITlsChannelJob>();
                     m_endpointJobLists.Add(a_endpointKey, endpointQueue);
@@ -852,7 +852,7 @@ namespace SIPSorcery.SIP
 
             if (nextJob != null)
             {
-                Task.Run(nextJob.Execute);
+                Task.Run((Action) nextJob.Execute);
             }
         }
 

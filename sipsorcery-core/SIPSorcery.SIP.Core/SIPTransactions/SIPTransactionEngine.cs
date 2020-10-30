@@ -17,7 +17,6 @@ namespace SIPSorcery.SIP
     {
         protected static ILog logger = AssemblyState.logger;
 
-        private static readonly int m_t6 = SIPTimings.T6;
         protected static readonly int m_maxRingTime = SIPTimings.MAX_RING_TIME; // Max time an INVITE will be left ringing for (typically 10 mins).    
 
         private readonly ConcurrentDictionary<string, SIPTransaction> m_transactions = new ConcurrentDictionary<string, SIPTransaction>();
@@ -212,14 +211,14 @@ namespace SIPSorcery.SIP
                         if (transaction.TransactionState == SIPTransactionStatesEnum.Confirmed)
                         {
                             // Need to wait until the transaction timeout period is reached in case any ACK re-transmits are received.
-                            if (DateTime.Now.Subtract(transaction.CompletedAt).TotalMilliseconds >= m_t6)
+                            if (DateTime.Now.Subtract(transaction.CompletedAt).TotalMilliseconds >= transaction.T6)
                             {
                                 expiredTransactionIds.Add(transaction.TransactionId);
                             }
                         }
                         else if (transaction.TransactionState == SIPTransactionStatesEnum.Completed)
                         {
-                            if (DateTime.Now.Subtract(transaction.CompletedAt).TotalMilliseconds >= m_t6)
+                            if (DateTime.Now.Subtract(transaction.CompletedAt).TotalMilliseconds >= transaction.T6)
                             {
                                 expiredTransactionIds.Add(transaction.TransactionId);
                             }
@@ -227,7 +226,7 @@ namespace SIPSorcery.SIP
                         else if (transaction.HasTimedOut)
                         {
                             // For INVITES need to give timed out transactions time to send the reliable repsonses and receive the ACKs.
-                            if (DateTime.Now.Subtract(transaction.TimedOutAt).TotalSeconds >= m_t6)
+                            if (DateTime.Now.Subtract(transaction.TimedOutAt).TotalSeconds >= transaction.T6)
                             {
                                 expiredTransactionIds.Add(transaction.TransactionId);
                             }
@@ -244,7 +243,7 @@ namespace SIPSorcery.SIP
                                 transaction.FireTransactionTimedOut();
                             }
                         }
-                        else if (DateTime.Now.Subtract(transaction.Created).TotalMilliseconds >= m_t6)
+                        else if (DateTime.Now.Subtract(transaction.Created).TotalMilliseconds >= transaction.T6)
                         {
                             //logger.Debug("INVITE transaction (" + transaction.TransactionId + ") " + transaction.TransactionRequestURI.ToString() + " in " + transaction.TransactionState + " has been alive for " + DateTime.Now.Subtract(transaction.Created).TotalSeconds.ToString("0") + ".");
 
@@ -263,7 +262,7 @@ namespace SIPSorcery.SIP
                     {
                         expiredTransactionIds.Add(transaction.TransactionId);
                     }
-                    else if (DateTime.Now.Subtract(transaction.Created).TotalMilliseconds >= m_t6)
+                    else if (DateTime.Now.Subtract(transaction.Created).TotalMilliseconds >= transaction.T6)
                     {
                         if (transaction.TransactionState == SIPTransactionStatesEnum.Calling ||
                             transaction.TransactionState == SIPTransactionStatesEnum.Trying ||

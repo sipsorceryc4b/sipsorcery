@@ -102,6 +102,7 @@ namespace SIPSorcery.SIP
             try
             {
                 SIPResponse sipResponse = new SIPResponse();
+                sipResponse.Created = sipMessage.Created;
                 sipResponse.LocalSIPEndPoint = sipMessage.LocalSIPEndPoint;
                 sipResponse.RemoteSIPEndPoint = sipMessage.RemoteSIPEndPoint;
                 string statusLine = sipMessage.FirstLine;
@@ -176,7 +177,9 @@ namespace SIPSorcery.SIP
         /// <returns>New copy of the SIPResponse.</returns>
         public SIPResponse Copy()
         {
-            return ParseSIPResponse(this.ToString());
+			var ret = ParseSIPResponse(this.ToString());
+            ret.Created = Created;
+            return ret;
         }
 
 		#region Unit testing.

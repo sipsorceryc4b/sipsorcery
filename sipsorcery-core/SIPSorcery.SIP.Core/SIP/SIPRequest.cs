@@ -118,6 +118,7 @@ namespace SIPSorcery.SIP
             try
             {
                 SIPRequest sipRequest = new SIPRequest();
+                sipRequest.Created = sipMessage.Created;
                 sipRequest.LocalSIPEndPoint = sipMessage.LocalSIPEndPoint;
                 sipRequest.RemoteSIPEndPoint = sipMessage.RemoteSIPEndPoint;
 
@@ -222,7 +223,9 @@ namespace SIPSorcery.SIP
         /// <returns>New copy of the SIPRequest.</returns>
         public SIPRequest Copy()
         {
-            return ParseSIPRequest(this.ToString());
+            var ret = ParseSIPRequest(this.ToString());
+            ret.Created = Created;
+            return ret;
         }
 		
 		public string CreateBranchId()

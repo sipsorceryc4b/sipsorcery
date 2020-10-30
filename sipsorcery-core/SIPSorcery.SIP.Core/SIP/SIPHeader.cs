@@ -357,6 +357,7 @@ namespace SIPSorcery.SIP
         //public const string DEFAULT_FROM_NAME = SIPConstants.SIP_DEFAULT_USERNAME;
         public const string DEFAULT_FROM_URI = SIPConstants.SIP_DEFAULT_FROMURI;
         public const string PARAMETER_TAG = SIPHeaderAncillary.SIP_HEADERANC_TAG;
+        public const string PARAMETER_EPID = SIPHeaderAncillary.SIP_HEADERANC_EPID;
 
         public string FromName
         {
@@ -389,6 +390,25 @@ namespace SIPSorcery.SIP
             }
         }
 
+        public string FromEpid
+        {
+            get { return FromParameters.Get(PARAMETER_EPID); }
+            set
+            {
+                if (value != null && value.Trim().Length > 0)
+                {
+                    FromParameters.Set(PARAMETER_EPID, value);
+                }
+                else
+                {
+                    if (FromParameters.Has(PARAMETER_EPID))
+                    {
+                        FromParameters.Remove(PARAMETER_EPID);
+                    }
+                }
+            }
+        }
+
         public SIPParameters FromParameters
         {
             get { return m_userField.Parameters; }
@@ -405,10 +425,11 @@ namespace SIPSorcery.SIP
         private SIPFromHeader()
         { }
 
-        public SIPFromHeader(string fromName, SIPURI fromURI, string fromTag)
+        public SIPFromHeader(string fromName, SIPURI fromURI, string fromTag, string epid = null)
         {
             m_userField = new SIPUserField(fromName, fromURI, null);
             FromTag = fromTag;
+            FromEpid = epid;
         }
 
         public static SIPFromHeader ParseFromHeader(string fromHeaderStr)
@@ -803,6 +824,8 @@ namespace SIPSorcery.SIP
     {
         public const string EXPIRES_PARAMETER_KEY = "expires";
         public const string QVALUE_PARAMETER_KEY = "q";
+        public const string OPAQUE_VALUE_PARAMETER_KEY = "opaque";
+        public const string GRUU_VALUE_PARAMETER_KEY = "gruu";
 
         private static ILog logger = AssemblyState.logger;
 
@@ -849,6 +872,16 @@ namespace SIPSorcery.SIP
         {
             get { return ContactParameters.Get(QVALUE_PARAMETER_KEY); }
             set { ContactParameters.Set(QVALUE_PARAMETER_KEY, value); }
+        }
+        public string Opaque
+        {
+            get { return ContactParameters.Get(OPAQUE_VALUE_PARAMETER_KEY); }
+            set { ContactParameters.Set(OPAQUE_VALUE_PARAMETER_KEY, value); }
+        }
+        public string Gruu
+        {
+            get { return ContactParameters.Get(GRUU_VALUE_PARAMETER_KEY); }
+            set { ContactParameters.Set(GRUU_VALUE_PARAMETER_KEY, value); }
         }
 
         private SIPUserField m_userField;
@@ -2588,6 +2621,7 @@ namespace SIPSorcery.SIP
                 headersBuilder.Append((Server != null && Server.Trim().Length != 0) ? SIPHeaders.SIP_HEADER_SERVER + ": " + this.Server + m_CRLF : null);
                 headersBuilder.Append((Subject != null) ? SIPHeaders.SIP_HEADER_SUBJECT + ": " + Subject + m_CRLF : null);
                 headersBuilder.Append((Supported != null) ? SIPHeaders.SIP_HEADER_SUPPORTED + ": " + Supported + m_CRLF : null);
+
                 headersBuilder.Append((Timestamp != null) ? SIPHeaders.SIP_HEADER_TIMESTAMP + ": " + Timestamp + m_CRLF : null);
                 headersBuilder.Append((Unsupported != null) ? SIPHeaders.SIP_HEADER_UNSUPPORTED + ": " + Unsupported + m_CRLF : null);
                 headersBuilder.Append((Warning != null) ? SIPHeaders.SIP_HEADER_WARNING + ": " + Warning + m_CRLF : null);
